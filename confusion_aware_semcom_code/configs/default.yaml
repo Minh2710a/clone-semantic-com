@@ -1,0 +1,89 @@
+project:
+  name: confusion_aware_tomato_semcom
+  output_root: ./outputs
+  seeds: [11, 22, 33, 44, 55]
+  device: auto
+  deterministic: true
+
+data:
+  # Thư mục theo cấu trúc ImageFolder: root/ten_lop/anh.jpg
+  root: ./data/PlantVillage
+  manifest_dir: ./data/manifests_tomato
+  # Để trống selected_classes và dùng class_name_contains để tự lấy các lớp Tomato.
+  selected_classes: []
+  class_name_contains: Tomato
+  image_size: 224
+  batch_size: 32
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  split_seed: 2026
+  split:
+    train: 0.70
+    val: 0.15
+    test: 0.15
+
+model:
+  backbone: mobilenet_v3_small
+  pretrained: false
+  feature_dim: 256
+  num_groups: 64
+  dropout: 0.10
+
+clean_training:
+  epochs: 50
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  receiver_loss_weight: 1.0
+  grad_clip: 5.0
+  amp: true
+  save_every_steps: 300
+
+channel:
+  average_power: 1.0
+  snr_grid: [-5, 0, 5, 10, 15, 20]
+  train_snr_grid: [-5, 0, 5, 10, 15, 20]
+  train_channel_types: [awgn]
+  train_csi_error_std: 0.0
+
+artifacts:
+  graph_channel: awgn
+
+policy:
+  min_groups: 4
+  # Tỷ lệ số nhóm phân biệt được truyền; các slot còn lại dùng lặp để bảo vệ.
+  snr_keep_table:
+    - {max_snr: -2.5, keep_ratio: 0.50}
+    - {max_snr: 2.5, keep_ratio: 0.625}
+    - {max_snr: 7.5, keep_ratio: 0.75}
+    - {max_snr: 12.5, keep_ratio: 0.875}
+    - {max_snr: 100.0, keep_ratio: 1.0}
+  severity_thresholds:
+    low: 0.05
+    high: 0.15
+  severity_multipliers:
+    low: 1.0
+    medium: 0.875
+    high: 0.75
+
+semcom_training:
+  epochs: 30
+  learning_rate: 0.0002
+  weight_decay: 0.0001
+  trainable: head       # head | projector | partial | all
+  fill_mode: mask       # mask | zero
+  lambda_margin: 0.20
+  lambda_fair: 0.05
+  margin: 1.0
+  grad_clip: 5.0
+  amp: true
+  save_every_steps: 300
+  validation_snrs: [0, 5]
+  validation_channel: awgn
+
+evaluation:
+  schemes: [random, global, class_specific, snr_only, pairwise, proposed, full]
+  budget_slots: [8, 16, 32, 64]
+  channel_types: [awgn, rayleigh]
+  monte_carlo_seeds: [0, 1, 2, 3, 4]
+  csi_error_std: 0.0

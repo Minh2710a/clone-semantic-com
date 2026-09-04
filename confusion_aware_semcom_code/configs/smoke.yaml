@@ -1,0 +1,68 @@
+project:
+  name: smoke_confusion_semcom
+  output_root: ./smoke_outputs
+  seeds: [7]
+  device: cpu
+  deterministic: true
+
+data:
+  root: ./smoke_data
+  manifest_dir: ./smoke_manifests
+  selected_classes: []
+  class_name_contains: ""
+  image_size: 64
+  batch_size: 8
+  num_workers: 0
+  pin_memory: false
+  persistent_workers: false
+  split_seed: 7
+  split: {train: 0.6, val: 0.2, test: 0.2}
+model:
+  backbone: small_cnn
+  pretrained: false
+  feature_dim: 32
+  num_groups: 8
+  dropout: 0.0
+clean_training:
+  epochs: 1
+  learning_rate: 0.001
+  weight_decay: 0.0
+  receiver_loss_weight: 1.0
+  grad_clip: 5.0
+  amp: false
+  save_every_steps: 2
+channel:
+  average_power: 1.0
+  snr_grid: [0, 10]
+  train_snr_grid: [0, 10]
+  train_channel_types: [awgn]
+  train_csi_error_std: 0.0
+artifacts:
+  graph_channel: awgn
+policy:
+  min_groups: 2
+  snr_keep_table:
+    - {max_snr: 5.0, keep_ratio: 0.5}
+    - {max_snr: 100.0, keep_ratio: 1.0}
+  severity_thresholds: {low: 0.05, high: 0.20}
+  severity_multipliers: {low: 1.0, medium: 0.75, high: 0.5}
+semcom_training:
+  epochs: 1
+  learning_rate: 0.001
+  weight_decay: 0.0
+  trainable: head
+  fill_mode: mask
+  lambda_margin: 0.1
+  lambda_fair: 0.01
+  margin: 1.0
+  grad_clip: 5.0
+  amp: false
+  save_every_steps: 2
+  validation_snrs: [0]
+  validation_channel: awgn
+evaluation:
+  schemes: [proposed, full]
+  budget_slots: [4, 8]
+  channel_types: [awgn]
+  monte_carlo_seeds: [0]
+  csi_error_std: 0.0

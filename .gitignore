@@ -1,0 +1,12 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.env
+.idea/
+.vscode/
+data/
+*.log
+smoke_data/
+*.pid
+smoke_manifests/

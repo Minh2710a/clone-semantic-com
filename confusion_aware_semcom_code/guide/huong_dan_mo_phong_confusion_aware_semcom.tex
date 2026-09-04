@@ -1,0 +1,341 @@
+\documentclass[11pt,journal,onecolumn]{IEEEtran}
+
+\usepackage{fontspec}
+\usepackage{polyglossia}
+\setmainlanguage{vietnamese}
+\setotherlanguage{english}
+\setmainfont{Noto Serif}
+\setsansfont{Noto Sans}
+\setmonofont{DejaVu Sans Mono}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{geometry}
+\geometry{a4paper,margin=20mm}
+\hypersetup{hidelinks}
+\setlist{nosep,leftmargin=1.5em}
+\lstset{
+  basicstyle=\ttfamily\small,
+  columns=fullflexible,
+  breaklines=true,
+  frame=single,
+  showstringspaces=false
+}
+
+\newcommand{\vect}[1]{\boldsymbol{#1}}
+\newcommand{\mat}[1]{\boldsymbol{#1}}
+\newcommand{\snr}{\mathrm{SNR}}
+\newcommand{\nsym}{N_{\mathrm{sym}}}
+\newcommand{\fmacro}{F_{1,\mathrm{macro}}}
+
+\title{Hướng dẫn triển khai và khôi phục mô phỏng\\
+Truyền đặc trưng ngữ nghĩa có xét nhầm lẫn lớp qua kênh vô tuyến}
+\author{Tài liệu kỹ thuật cho nhóm sinh viên nghiên cứu khoa học}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Tài liệu này hướng dẫn triển khai gói mã mô phỏng cho hệ thống truyền đặc trưng ngữ nghĩa phục vụ phân loại bệnh lá cà chua. Quy trình được tổ chức theo các khối: trích xuất đặc trưng tại phía phát, ước lượng cặp lớp cạnh tranh, xây dựng đồ thị nhầm lẫn phụ thuộc SNR, xếp hạng nhóm đặc trưng theo biên quyết định cặp lớp, phân bổ bảo vệ dưới ngân sách symbol cố định, và phân loại tại phía thu. Mỗi giai đoạn có checkpoint, tệp trạng thái và tiêu chí đạt. Khi mất điện hoặc tiến trình bị dừng, sinh viên chạy lại đúng lệnh trước đó; chương trình tự nạp checkpoint gần nhất và bỏ qua các ô mô phỏng đã hoàn thành.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Semantic communication, task-oriented communication, feature transmission, class confusion, unequal protection, checkpoint, AWGN, Rayleigh fading.
+\end{IEEEkeywords}
+
+\section{Mục tiêu và phạm vi hiện thực}
+Trong kịch bản camera biên gửi thông tin ảnh lá cà chua tới máy chủ, đầu ra cần bảo toàn là nhãn bệnh và độ tin cậy phân loại, không phải ảnh khôi phục có PSNR cao. Gói mã hiện thực đường truyền đặc trưng M1--M5 của bản thảo: MobileNetV3-Small hoặc ResNet-18 tại phía phát, bộ ước lượng hai lớp cạnh tranh, codebook đặc trưng theo biên logit, bộ ánh xạ đặc trưng sang symbol phức, kênh AWGN/Rayleigh, bộ khôi phục nhóm đặc trưng và bộ phân loại phía thu.
+
+Mục tiêu kiểm chứng là: với cùng ngân sách symbol và công suất trung bình, phương án đề xuất có cải thiện $\fmacro$, recall lớp yếu nhất hoặc mức nhầm lẫn cặp lớp xấu nhất so với global importance, SNR-only và pairwise-only hay không. Kết quả không được quy cho phương pháp nếu ngân sách symbol khác nhau.
+
+Phiên bản mã này khóa phần đóng góp chính và các ablation trực tiếp. Chuỗi JPEG/BPG--channel coding--QPSK, DeepJSCC tái tạo ảnh, OFDM/TDL và LDPC chưa được trộn vào pipeline lõi. Các baseline này phải được bổ sung sau khi cơ chế confusion-aware vượt qua kiểm tra nhân quả ở AWGN/Rayleigh; cách tách này tránh việc một modem hoặc decoder phức tạp che khuất tác động của bộ chọn đặc trưng.
+
+\section{Cấu trúc thư mục}
+\begin{lstlisting}
+confusion_aware_semcom_code/
+|-- configs/
+|   |-- default.yaml
+|   `-- smoke.yaml
+|-- src/semcom/
+|   |-- data.py, models.py, channel.py
+|   |-- policy.py, losses.py, metrics.py
+|   |-- checkpoint.py, engine.py
+|   `-- config.py, io.py, seed.py
+|-- scripts/
+|   |-- prepare_dataset.py
+|   |-- train_clean.py
+|   |-- build_artifacts.py
+|   |-- train_semcom.py
+|   |-- evaluate.py
+|   |-- analyze_artifacts.py
+|   |-- plot_results.py
+|   |-- verify_checkpoints.py
+|   |-- run_pipeline.py
+|   `-- smoke_test.py
+`-- guide/
+\end{lstlisting}
+
+Các tệp trong \texttt{src/semcom} chứa mô hình và logic khoa học. Các tệp trong \texttt{scripts} chỉ điều phối thí nghiệm, không thay đổi định nghĩa phương pháp.
+
+\section{Mô hình được hiện thực}
+\subsection{Đặc trưng và nhóm đặc trưng}
+Ảnh đầu vào $\vect{x}$ được ánh xạ thành vector $\vect{z}\in\mathbb{R}^{D}$ và chia thành $G$ nhóm:
+\begin{equation}
+\vect{z}=f_{\theta}(\vect{x}),\qquad
+\mat{Z}=\mathrm{reshape}(\vect{z})\in\mathbb{R}^{G\times d_g},
+\quad D=Gd_g.
+\end{equation}
+Phép chia nhóm quyết định đơn vị chọn và bảo vệ trên đường truyền; cấu hình mặc định dùng $D=256$, $G=64$, và $d_g=4$.
+
+\subsection{Đồ thị nhầm lẫn phụ thuộc SNR}
+Tại mỗi mức SNR $\gamma$, trọng số giữa hai lớp được tính từ confusion matrix trên tập validation:
+\begin{equation}
+w_{ij}(\gamma)=\frac{1}{2}\left[
+\Pr(\hat y=j\mid y=i,\gamma)+
+\Pr(\hat y=i\mid y=j,\gamma)
+\right].
+\end{equation}
+Đại lượng này điều khiển mức độ nghiêm trọng của cặp lớp tại từng điều kiện kênh; nó không được ước lượng trên tập test.
+
+\subsection{Xếp hạng đặc trưng theo biên cặp lớp}
+Bộ phân loại cục bộ là lớp tuyến tính trên $\vect{z}$. Với cặp $(i,j)$, score của chiều đặc trưng $k$ là
+\begin{equation}
+s_k^{(i,j)}(\vect{x})=
+\left|z_k\frac{\partial(a_i-a_j)}{\partial z_k}\right|.
+\end{equation}
+Do local head tuyến tính, gradient bằng hiệu hai vector trọng số. Codebook được tính offline bằng trung bình $|z_k|\,|w_{i,k}-w_{j,k}|$ trên validation set, sau đó cộng theo từng nhóm. Cách này bảo toàn đúng định nghĩa gradient--activation nhưng tránh tính backward cho từng mẫu khi triển khai.
+
+\subsection{Ngân sách slot và số symbol}
+Mỗi nhóm có $d_g/2$ symbol phức. Nếu ngân sách là $B_s$ slot nhóm thì
+\begin{equation}
+\nsym=B_s\frac{d_g}{2}.
+\end{equation}
+Phương trình này khóa tài nguyên kênh của mọi phương án. Khi chỉ chọn $K<B_s$ nhóm, các slot còn lại lặp các nhóm có thứ hạng cao; phía thu cân bằng kênh và trung bình các bản lặp.
+
+\subsection{Kênh truyền}
+Kênh AWGN và Rayleigh block fading được mô phỏng theo
+\begin{align}
+\vect{r}&=\vect{u}+\vect{n}, &&\text{AWGN},\\
+\vect{r}&=h\vect{u}+\vect{n}, &&h\sim\mathcal{CN}(0,1).
+\end{align}
+Nhiễu phức được đặt theo $\sigma_n^2=P10^{-\gamma/10}$. Hệ số chuẩn hóa đặc trưng là một hằng số được hiệu chuẩn trên tập train và dùng chung ở hai phía; không sử dụng hệ số chuẩn hóa riêng từng mẫu nên không tạo kênh báo hiệu phụ không được tính.
+
+\section{Chuẩn bị môi trường}
+\begin{lstlisting}[language=bash]
+cd confusion_aware_semcom_code
+python -m venv .venv
+source .venv/bin/activate
+# Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+python scripts/smoke_test.py
+\end{lstlisting}
+
+\textbf{Checkpoint C0 đạt} khi lệnh smoke test kết thúc bằng \texttt{Smoke test passed} và sinh \texttt{summary\_aggregated.csv}. Nếu C0 không đạt, không chạy dữ liệu thật.
+
+\section{Chuẩn bị dữ liệu}
+Dữ liệu phải có cấu trúc ImageFolder:
+\begin{lstlisting}
+PlantVillage/
+|-- Tomato___Bacterial_spot/
+|-- Tomato___Early_blight/
+|-- Tomato___Late_blight/
+`-- ...
+\end{lstlisting}
+
+Sửa ba trường trong \texttt{configs/default.yaml}: \texttt{data.root}, \texttt{data.manifest\_dir}, và \texttt{project.output\_root}. Nếu tên lớp chứa từ ``Tomato'', giữ \texttt{class\_name\_contains: Tomato}; nếu không, điền chính xác danh sách \texttt{selected\_classes}.
+
+Chạy:
+\begin{lstlisting}[language=bash]
+python scripts/prepare_dataset.py --config configs/default.yaml
+\end{lstlisting}
+
+Chương trình chia dữ liệu theo source identifier trước khi augmentation. Các ảnh có hậu tố phổ biến như \texttt{\_aug}, \texttt{\_flip}, \texttt{\_rot} được giữ trong cùng một split để giảm nguy cơ rò rỉ dữ liệu.
+
+\textbf{Checkpoint C1 đạt} khi:
+\begin{itemize}
+\item \texttt{train.csv}, \texttt{val.csv}, \texttt{test.csv} tồn tại;
+\item số lớp và số mẫu từng lớp trong \texttt{metadata.json} đúng với dữ liệu;
+\item không có source identifier xuất hiện ở nhiều split;
+\item mỗi lớp có mẫu ở validation và test.
+\end{itemize}
+
+\section{Chạy pipeline và tự khôi phục}
+Lệnh đầy đủ cho một seed:
+\begin{lstlisting}[language=bash]
+python scripts/run_pipeline.py \
+  --config configs/default.yaml \
+  --seed 11
+\end{lstlisting}
+
+Khi mất điện hoặc tiến trình bị dừng, chạy lại đúng lệnh trên. Không thêm \texttt{--force}. Pipeline tự thực hiện:
+\begin{enumerate}
+\item nạp \texttt{latest.pt} của giai đoạn đang huấn luyện;
+\item khôi phục model, optimizer, scheduler, AMP scaler và trạng thái RNG;
+\item đọc \texttt{pipeline\_state.json};
+\item bỏ qua artifact và mô hình đã có \texttt{best.pt};
+\item bỏ qua từng ô kết quả JSON đã hoàn thành.
+\end{enumerate}
+
+Checkpoint được ghi nguyên tử qua file tạm rồi đổi tên. Nếu mất điện đúng lúc ghi, phiên bản checkpoint trước vẫn còn hợp lệ. Với \texttt{save\_every\_steps=300}, lượng tính toán mất tối đa xấp xỉ 299 batch. Có thể giảm khoảng này khi nguồn điện không ổn định, đổi lại số lần ghi đĩa tăng.
+
+Kiểm tra toàn bộ checkpoint sau sự cố hoặc sau khi chép dữ liệu:
+\begin{lstlisting}[language=bash]
+python scripts/verify_checkpoints.py \
+  --config configs/default.yaml --seed 11
+\end{lstlisting}
+
+\textbf{Không đổi config giữa hai lần resume.} Hash cấu hình được lưu trong checkpoint. Nếu thay đổi tham số, chương trình tạo thư mục thí nghiệm khác hoặc từ chối nạp checkpoint không tương thích.
+
+\section{Các giai đoạn và tiêu chí đạt}
+\subsection{Giai đoạn A: bộ phân loại không qua kênh}
+\begin{lstlisting}[language=bash]
+python scripts/train_clean.py \
+  --config configs/default.yaml --seed 11
+\end{lstlisting}
+
+Đầu ra chính là \texttt{checkpoints/clean/best.pt} và \texttt{clean\_history.csv}. Không chuyển sang communication stage nếu mô hình clean chưa hội tụ hoặc recall một lớp gần bằng không.
+
+\textbf{Checkpoint C2 đạt} khi:
+\begin{itemize}
+\item training loss giảm ổn định;
+\item validation macro-F1 không còn tăng rõ trong nhiều epoch cuối;
+\item confusion matrix clean chỉ ra các cặp lớp khó hợp lý;
+\item số tham số và backbone đúng cấu hình.
+\end{itemize}
+
+\subsection{Giai đoạn B: artifact cố định}
+\begin{lstlisting}[language=bash]
+python scripts/build_artifacts.py \
+  --config configs/default.yaml --seed 11
+python scripts/analyze_artifacts.py \
+  --config configs/default.yaml --seed 11
+\end{lstlisting}
+
+Ba artifact bắt buộc là \texttt{feature\_scale.pt}, \texttt{confusion\_graph.pt}, và \texttt{pairwise\_codebook.pt}.
+
+\textbf{Checkpoint C3 đạt} khi:
+\begin{itemize}
+\item hệ số chuẩn hóa hữu hạn và dương;
+\item top confusion pair không hoàn toàn ngẫu nhiên giữa các SNR;
+\item ít nhất một cặp lớp có trọng số nhầm lẫn tăng khi SNR giảm;
+\item top feature groups của các cặp lớp không đồng nhất hoàn toàn.
+\end{itemize}
+
+Nếu thứ tự cặp lớp không thay đổi theo SNR, đóng góp ``SNR-conditioned confusion graph'' chưa được chứng minh. Khi đó phải giảm số lớp, kiểm tra classifier, hoặc xem lại cách hiệu chuẩn đường truyền full-feature trước khi viết claim.
+
+\subsection{Giai đoạn C: huấn luyện từng phương án}
+Ví dụ chạy phương án đề xuất với 32 slot:
+\begin{lstlisting}[language=bash]
+python scripts/train_semcom.py \
+  --config configs/default.yaml \
+  --seed 11 \
+  --scheme proposed \
+  --budget-slots 32
+\end{lstlisting}
+
+Các scheme được hỗ trợ:
+\begin{longtable}{p{0.18\linewidth}p{0.74\linewidth}}
+\toprule
+Scheme & Vai trò kỹ thuật \\
+\midrule
+\endhead
+\texttt{random} & Chọn ngẫu nhiên; kiểm tra lợi ích của ranking. \\
+\texttt{global} & Một ranking chung cho toàn bộ lớp; baseline importance-aware. \\
+\texttt{class\_specific} & Ranking theo lớp top-1, chưa dùng cặp lớp. \\
+\texttt{snr\_only} & Ranking global, số nhóm thay đổi theo SNR. \\
+\texttt{pairwise} & Ranking cặp lớp và keep ratio theo SNR, không điều chỉnh bằng trọng số confusion. \\
+\texttt{proposed} & Ranking cặp lớp kết hợp confusion severity và lặp bảo vệ dưới cùng budget. \\
+\texttt{full} & Gửi toàn bộ nhóm; chỉ hợp lệ khi budget slot không nhỏ hơn số nhóm. \\
+\bottomrule
+\end{longtable}
+
+\textbf{Checkpoint C4 đạt} khi \texttt{best.pt} tồn tại cho từng tổ hợp scheme--budget, validation macro-F1 hữu hạn, và công suất phát trung bình gần giá trị cấu hình. Nếu một scheme dùng ít hoặc nhiều symbol hơn, phải sửa policy trước khi so sánh.
+
+\subsection{Giai đoạn D: đánh giá Monte Carlo}
+\begin{lstlisting}[language=bash]
+python scripts/evaluate.py \
+  --config configs/default.yaml --seed 11
+python scripts/plot_results.py \
+  --config configs/default.yaml --seed 11 --channel awgn
+\end{lstlisting}
+
+Mỗi ô $(\text{scheme},B_s,\text{channel},\snr,\text{MC seed})$ được lưu thành một JSON. Khi lỗi giữa chừng, chạy lại lệnh; các JSON đã có không được tính lại.
+
+\textbf{Checkpoint C5 đạt} khi có đủ các cột: accuracy, macro-F1, minimum-class recall, worst directed confusion, complex symbols/sample, selected groups, repetition ratio, runtime và top-2 pair coverage.
+
+\section{Thiết kế mô phỏng theo thứ tự}
+Không chạy toàn bộ ma trận ngay từ đầu. Thực hiện theo ba vòng.
+
+\subsection{Vòng 1: kiểm tra cơ chế}
+Dùng một seed, AWGN, budget 32, ba scheme \texttt{global}, \texttt{pairwise}, \texttt{proposed}, và SNR $\{0,5,10\}$ dB. Mục tiêu là xác nhận code không lỗi và policy thực sự thay đổi selected groups hoặc repetition ratio.
+
+\subsection{Vòng 2: ablation nhân quả}
+Khóa một budget chính, chạy năm seed trên AWGN. So sánh:
+\begin{enumerate}
+\item global với pairwise để tách tác động của pair-specific ranking;
+\item pairwise với proposed để tách tác động của confusion severity;
+\item snr-only với proposed để tách tác động của class-pair information;
+\item zero filling với mask token;
+\item predicted top-2 pair với oracle pair chỉ như upper bound.
+\end{enumerate}
+
+Mã hiện tại không dùng oracle label trong policy triển khai. Nếu bổ sung oracle ablation, phải đặt tên rõ là upper bound và không đưa vào phương án khả thi.
+
+\subsection{Vòng 3: độ bền kênh và tài nguyên}
+Sau khi Vòng 2 có hiệu ứng rõ, chạy AWGN và Rayleigh trên SNR $\{-5,0,5,10,15,20\}$ dB, budget $\{8,16,32,64\}$, năm seed. CSI error chỉ được bật sau khi perfect-CSI result ổn định.
+
+\section{Kết quả phải xuất cho bài báo}
+Bộ hình tối thiểu gồm:
+\begin{itemize}
+\item macro-F1 theo SNR tại hai budget cố định;
+\item minimum-class recall theo SNR;
+\item macro-F1 theo số symbol tại một SNR thấp và một SNR trung bình;
+\item worst-pair confusion theo SNR;
+\item confusion matrix của clean, global và proposed;
+\item runtime--performance của offline codebook và online scoring nếu có.
+\end{itemize}
+
+Bảng chính phải báo cáo cùng lúc metric tác vụ, tài nguyên và độ phức tạp. Không lập bảng chỉ có accuracy.
+
+\section{Quy tắc kết luận}
+Phương án chỉ được mô tả là \emph{confusion-aware} nếu proposed vượt pairwise-only dưới cùng $\nsym$. Chỉ được mô tả là \emph{channel-adaptive} nếu mask, số nhóm hoặc số bản lặp thay đổi theo SNR và ablation SNR-only đã được báo cáo. Chỉ được mô tả là \emph{class-wise reliable} nếu minimum-class recall hoặc worst-pair confusion cải thiện với khoảng tin cậy trên nhiều seed.
+
+Quan sát kết quả theo nhịp: quan sát $\rightarrow$ so sánh $\rightarrow$ giải thích $\rightarrow$ hàm ý. Ví dụ: ``Tại 0--5 dB, proposed tăng minimum-class recall so với pairwise-only dưới cùng 64 complex symbols; mức tăng đi cùng số nhóm chọn thấp hơn và nhiều bản lặp hơn, cho thấy confusion severity đã chuyển tài nguyên từ độ rộng representation sang bảo vệ cặp lớp khó. Ở 15--20 dB, các phương án hội tụ vì lỗi kênh không còn là bottleneck.'' Chỉ dùng câu này khi số liệu thực sự hỗ trợ.
+
+\section{Xử lý lỗi thường gặp}
+\begin{longtable}{p{0.27\linewidth}p{0.65\linewidth}}
+\toprule
+Hiện tượng & Cách xử lý \\
+\midrule
+\endhead
+Config/checkpoint mismatch & Dùng \texttt{resolved\_config.yaml} trong run directory; không ép nạp checkpoint của cấu hình khác. \\
+CUDA hết bộ nhớ & Giảm batch size; không đổi feature dimension giữa lúc resume. Sau khi đổi config, chạy run mới. \\
+DataLoader treo & Đặt \texttt{num\_workers: 0}, \texttt{persistent\_workers: false}. \\
+Mất điện giữa epoch & Chạy lại đúng lệnh; \texttt{latest.pt} hoặc \texttt{emergency.pt} được nạp tự động. \\
+Một JSON kết quả lỗi & Xóa đúng JSON hỏng, chạy lại evaluate; không dùng \texttt{--force} cho toàn bộ lưới. \\
+Full scheme báo thiếu slot & Chỉ chạy full khi \texttt{budget\_slots >= num\_groups}. \\
+Macro-F1 cao nhưng min recall thấp & Kiểm tra mất cân bằng lớp, pair estimator và $\lambda_f$; không kết luận reliability. \\
+Proposed giống pairwise & Confusion thresholds không kích hoạt hoặc graph không phân tách severity; kiểm tra \texttt{confusion\_edges\_top.csv}. \\
+\bottomrule
+\end{longtable}
+
+\section{Lệnh chạy nhiều seed}
+Sau khi khóa \texttt{default.yaml}, chạy độc lập từng seed:
+\begin{lstlisting}[language=bash]
+for s in 11 22 33 44 55; do
+  python scripts/run_pipeline.py \
+    --config configs/default.yaml --seed $s
+done
+\end{lstlisting}
+
+Không gộp checkpoint giữa các seed. Mỗi seed có thư mục riêng và trạng thái RNG riêng. Sau khi đủ năm seed, tổng hợp mean, standard deviation và 95\% confidence interval từ các tệp \texttt{summary\_raw.csv}.
+
+\section{Kết luận vận hành}
+Trình tự bắt buộc là C0 $\rightarrow$ C1 $\rightarrow$ C2 $\rightarrow$ C3 $\rightarrow$ C4 $\rightarrow$ C5. Không chuyển sang Rayleigh, CSI error, digital modulation hoặc PlantDoc trước khi cơ chế proposed vượt các ablation trực tiếp ở AWGN dưới cùng ngân sách symbol. Mục tiêu của mã không phải tạo đường cong đẹp, mà xác định chính xác điều kiện SNR và budget mà confusion-aware protection có tác động đo được lên đầu ra phân loại phía thu.
+
+\end{document}
