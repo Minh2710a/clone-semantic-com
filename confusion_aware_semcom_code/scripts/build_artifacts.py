@@ -14,6 +14,7 @@ from semcom.engine import (
     build_pairwise_codebook,
     calibrate_feature_scale,
     get_device,
+    load_feature_scales,
 )
 from semcom.seed import seed_everything
 
@@ -41,13 +42,32 @@ def main() -> None:
     codebook_path = artifact_dir / "pairwise_codebook.pt"
 
     if args.force or not scale_path.exists():
-        scale = calibrate_feature_scale(model, loaders["train"], device, scale_path)
-        print(f"Feature scale: {scale:.6f}")
+
+        normalization_scales = (
+            calibrate_feature_scale(
+                model,
+                loaders["train"],
+                device,
+                scale_path,
+            )
+        )
+
     else:
-        scale = float(torch.load(scale_path, map_location="cpu", weights_only=False)["normalization_scale"])
-        print(f"Reuse feature scale: {scale:.6f}")
+
+        normalization_scales = (
+            load_feature_scales(scale_path)
+        )
+    print(f"Feature scale: {scale:.6f}")
+    print(f"Reuse feature scale: {scale:.6f}")
     if args.force or not graph_path.exists():
-        build_confusion_graph(cfg, model, loaders["val"], num_classes, scale, graph_path)
+        build_confusion_graph(
+            cfg,
+            model,
+            loaders["val"],
+            num_classes,
+            normalization_scales,
+            graph_path,
+        )
         print(f"Built confusion graph: {graph_path}")
     else:
         print(f"Reuse confusion graph: {graph_path}")

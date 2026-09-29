@@ -271,22 +271,119 @@ def calibrate_feature_scale(
     loader: torch.utils.data.DataLoader,
     device: torch.device,
     output_path: str | Path,
-) -> float:
+) -> torch.Tensor:
     model.eval()
-    sum_power = 0.0
-    count = 0
-    for images, _labels, _paths in tqdm(loader, desc="calibrate feature scale", leave=False):
-        images = images.to(device, non_blocking=True)
-        groups, _vector = model.encode(images)
-        complex_groups = torch.view_as_complex(groups.reshape(*groups.shape[:-1], groups.shape[-1] // 2, 2).contiguous())
-        sum_power += float(complex_groups.abs().square().sum().cpu())
-        count += complex_groups.numel()
-    scale = math.sqrt(sum_power / max(count, 1))
-    payload = {"normalization_scale": scale, "complex_samples": count}
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    atomic_torch_save(payload, output_path)
-    return scale
 
+    num_groups = model.num_groups
+
+    # Tổng power riêng cho từng feature group
+    group_power_sum = torch.zeros(
+        num_groups,
+        dtype=torch.float64,
+        device=device,
+    )
+
+    complex_samples_per_group = 0
+
+    for images, _labels, _paths in tqdm(
+        loader,
+        desc="calibrate feature scales",
+        leave=False,
+    ):
+        images = images.to(device, non_blocking=True)
+
+        groups, _vector = model.encode(images)
+
+        # groups shape:
+        # [batch, num_groups, group_dim]
+        #
+        # complex_groups shape:
+        # [batch, num_groups, group_dim / 2]
+        complex_groups = torch.view_as_complex(
+            groups.float().reshape(
+                groups.shape[0],
+                groups.shape[1],
+                groups.shape[2] // 2,
+                2,
+            ).contiguous()
+        )
+
+        group_power_sum += (
+            complex_groups
+            .abs()
+            .square()
+            .sum(dim=(0, 2))
+            .to(torch.float64)
+        )
+
+        complex_samples_per_group += (
+            complex_groups.shape[0]
+            * complex_groups.shape[2]
+        )
+
+    group_mean_power = (
+        group_power_sum
+        / max(complex_samples_per_group, 1)
+    )
+
+    normalization_scales = (
+        torch.sqrt(group_mean_power)
+        .clamp_min(1e-8)
+        .to(torch.float32)
+    )
+
+    payload = {
+        "artifact_version": 2,
+        "normalization_scales": normalization_scales.cpu(),
+        "complex_samples_per_group": complex_samples_per_group,
+    }
+
+    Path(output_path).parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    atomic_torch_save(payload, output_path)
+
+    return normalization_scales.cpu()
+
+def load_feature_scales(
+    path: str | Path,
+) -> torch.Tensor:
+
+    payload = torch.load(
+        path,
+        map_location="cpu",
+        weights_only=False,
+    )
+
+    if "normalization_scales" not in payload:
+        raise RuntimeError(
+            "Old feature-scale artifact detected. "
+            "Rebuild feature_scale.pt."
+        )
+
+    scales = torch.as_tensor(
+        payload["normalization_scales"],
+        dtype=torch.float32,
+    )
+
+    if scales.ndim != 1:
+        raise ValueError(
+            "normalization_scales must be 1-D"
+        )
+
+    if not torch.isfinite(scales).all():
+        raise ValueError(
+            "normalization_scales contains NaN/Inf"
+        )
+
+    if (scales <= 0).any():
+        raise ValueError(
+            "Every normalization scale must be positive"
+        )
+
+    return scales
 
 @torch.inference_mode()
 def build_confusion_graph(
@@ -294,7 +391,7 @@ def build_confusion_graph(
     model: FeatureSemanticModel,
     loader: torch.utils.data.DataLoader,
     num_classes: int,
-    normalization_scale: float,
+    normalization_scales: torch.Tensor,
     output_path: str | Path,
 ) -> Path:
     device = next(model.parameters()).device
@@ -304,7 +401,7 @@ def build_confusion_graph(
     link = AnalogFeatureLink(
         average_power=float(cfg["channel"].get("average_power", 1.0)),
         fill_mode="zero",
-        normalization_scale=normalization_scale,
+        normalization_scales=normalization_scales,
     ).to(device)
     weights = []
     confusions = []
@@ -329,7 +426,7 @@ def build_confusion_graph(
         "confusions": torch.stack(confusions),
         "weights": torch.stack(weights),
         "channel": graph_channel,
-        "normalization_scale": normalization_scale,
+        "normalization_scales": normalization_scales.detach().cpu(),
     }
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -423,11 +520,20 @@ def train_semcom_scheme(
         budget_slots=budget_slots,
         policy_cfg=cfg["policy"],
     )
-    scale = float(torch.load(scale_path, map_location="cpu", weights_only=False)["normalization_scale"])
+    normalization_scales = load_feature_scales(
+        scale_path
+    )
     link = AnalogFeatureLink(
-        average_power=float(cfg["channel"].get("average_power", 1.0)),
-        fill_mode=str(cfg["semcom_training"].get("fill_mode", "mask")),
-        normalization_scale=scale,
+        average_power=float(
+            cfg["channel"].get("average_power", 1.0)
+        ),
+        fill_mode=str(
+            cfg["semcom_training"].get(
+                "fill_mode",
+                "mask"
+            )
+        ),
+        normalization_scales=normalization_scales,
     ).to(device)
 
     train_cfg = cfg["semcom_training"]
@@ -690,6 +796,7 @@ def evaluate_semcom(
     symbols_sum = 0.0
     selected_sum = 0.0
     replicas_sum = 0.0
+    tx_power_sum = 0.0
     pair_correct = 0
     pair_total = 0
     for images, labels, _paths in loader:
@@ -710,6 +817,9 @@ def evaluate_semcom(
             channel_type,
             mask_token=model.mask_token,
             csi_error_std=csi_error_std,
+        )
+        tx_power_sum += (
+            stats.tx_power_mean * batch
         )
         logits = model.receiver_logits_from_groups(recovered)
         if device.type == "cuda":
@@ -737,6 +847,7 @@ def evaluate_semcom(
             "top2_pair_contains_label": pair_correct / max(pair_total, 1),
             "task_efficiency": result["macro_f1"] / max(symbols_sum / max(total_samples, 1), 1e-12),
             "model_parameters": count_parameters(model),
+            "tx_power_mean": tx_power_sum / max(total_samples, 1),
         }
     )
     return result

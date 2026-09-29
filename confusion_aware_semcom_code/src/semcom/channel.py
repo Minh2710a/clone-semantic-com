@@ -47,15 +47,47 @@ class AnalogFeatureLink(torch.nn.Module):
         self,
         average_power: float = 1.0,
         fill_mode: str = "zero",
-        normalization_scale: float = 1.0,
+        normalization_scales: torch.Tensor | float = 1.0,
     ) -> None:
         super().__init__()
+
         self.average_power = float(average_power)
         self.fill_mode = fill_mode
-        self.normalization_scale = float(normalization_scale)
-        if self.normalization_scale <= 0:
-            raise ValueError("normalization_scale must be positive")
 
+        if not math.isfinite(self.average_power) \
+                or self.average_power <= 0:
+            raise ValueError(
+                "average_power must be finite and positive"
+            )
+
+        scales = torch.as_tensor(
+            normalization_scales,
+            dtype=torch.float32,
+        )
+
+        if scales.ndim == 0:
+            scales = scales.reshape(1)
+
+        if scales.ndim != 1:
+            raise ValueError(
+                "normalization_scales must be scalar "
+                "or 1-D tensor"
+            )
+
+        if not torch.isfinite(scales).all():
+            raise ValueError(
+                "normalization_scales contains NaN/Inf"
+            )
+
+        if (scales <= 0).any():
+            raise ValueError(
+                "Every normalization scale must be positive"
+            )
+
+        self.register_buffer(
+            "normalization_scales",
+            scales.clone(),
+        )
     def forward(
         self,
         groups: torch.Tensor,
@@ -68,6 +100,21 @@ class AnalogFeatureLink(torch.nn.Module):
         if groups.ndim != 3:
             raise ValueError("groups must have shape [batch, num_groups, group_dim]")
         batch, num_groups, group_dim = groups.shape
+        if self.normalization_scales.numel() == 1:
+            group_scales = (
+                self.normalization_scales.expand(num_groups)
+            )
+
+        elif self.normalization_scales.numel() == num_groups:
+            group_scales = self.normalization_scales
+
+        else:
+            raise ValueError(
+                "Number of normalization scales does not "
+                "match num_groups: "
+                f"{self.normalization_scales.numel()} "
+                f"vs {num_groups}"
+    )
         if len(plans) != batch:
             raise ValueError("One transmission plan is required per sample")
         if group_dim % 2 != 0:
@@ -88,20 +135,38 @@ class AnalogFeatureLink(torch.nn.Module):
             for group_id, copies in zip(plan.selected_groups, plan.copies):
                 if group_id < 0 or group_id >= num_groups:
                     raise IndexError(f"Group id {group_id} outside [0,{num_groups})")
-                group_complex = torch.view_as_complex(groups[b, group_id].reshape(complex_per_group, 2).contiguous())
+                group_complex = torch.view_as_complex(
+                    groups[b, group_id]
+                    .float()
+                    .reshape(complex_per_group, 2)
+                    .contiguous()
+                )
+
+                group_scale = (
+                    group_scales[group_id]
+                    .to(device=device)
+                    .clamp_min(1e-8)
+                )
+
+                group_gain = (
+                    self.average_power ** 0.5
+                ) / group_scale
+
+                normalized_group = (
+                    group_complex * group_gain
+                )
+
                 for _ in range(copies):
-                    tx[b, cursor] = group_complex
+                    tx[b, cursor] = normalized_group
                     slot_group_ids[b, cursor] = group_id
                     cursor += 1
-            cursor_by_sample.append(cursor)
+                cursor_by_sample.append(cursor)
         if any(cursor != budget_slots for cursor in cursor_by_sample):
             raise RuntimeError("Transmission plan does not fill the fixed slot budget")
 
         # A fixed feature scale is calibrated on the training split and shared by
         # transmitter and receiver. This enforces the average power constraint in
         # expectation without requiring a per-sample normalization side channel.
-        power_gain = (self.average_power ** 0.5) / self.normalization_scale
-        tx = tx * power_gain
 
         snr_db = snr_db.to(device=device, dtype=torch.float32).reshape(batch, 1, 1)
         noise_variance = self.average_power / torch.pow(10.0, snr_db / 10.0)
@@ -138,7 +203,22 @@ class AnalogFeatureLink(torch.nn.Module):
         for b, plan in enumerate(plans):
             for group_id in plan.selected_groups:
                 positions = torch.where(slot_group_ids[b] == group_id)[0]
-                estimate = equalized[b, positions].mean(dim=0) / power_gain
+                estimate = (
+                    equalized[b, positions]
+                    .mean(dim=0)
+                )
+
+                group_scale = (
+                    group_scales[group_id]
+                    .to(device=device)
+                    .clamp_min(1e-8)
+                )
+
+                group_gain = (
+                    self.average_power ** 0.5
+                ) / group_scale
+
+                estimate = estimate / group_gain
                 recovered[b, group_id] = torch.view_as_real(estimate).reshape(group_dim).to(dtype)
 
         stats = LinkStatistics(

@@ -11,7 +11,7 @@ from _common import base_parser, load_cfg_from_args
 from semcom.channel import AnalogFeatureLink
 from semcom.config import experiment_root
 from semcom.data import make_loaders
-from semcom.engine import build_model, evaluate_semcom, get_device
+from semcom.engine import build_model, evaluate_semcom, get_device, load_feature_scales
 from semcom.io import atomic_json_dump
 from semcom.policy import PolicyArtifacts, SemanticTransmissionPolicy
 from semcom.seed import seed_everything
@@ -33,7 +33,9 @@ def evaluate_grid(
     codebook_path = artifact_dir / "pairwise_codebook.pt"
     scale_path = artifact_dir / "feature_scale.pt"
     artifacts = PolicyArtifacts.load(str(codebook_path), str(graph_path), map_location="cpu")
-    scale = float(torch.load(scale_path, map_location="cpu", weights_only=False)["normalization_scale"])
+    normalization_scales = (
+        load_feature_scales(scale_path)
+    )
 
     schemes = schemes or list(cfg["evaluation"]["schemes"])
     budgets = budgets or [int(value) for value in cfg["evaluation"]["budget_slots"]]
@@ -49,8 +51,11 @@ def evaluate_grid(
                 continue
             run_dir = root / "schemes" / scheme / f"slots{budget}"
             checkpoint_path = run_dir / "checkpoints" / f"semcom_{scheme}_slots{budget}" / "best.pt"
+            missing_checkpoints = []
             if not checkpoint_path.exists():
-                print(f"[skip] missing checkpoint {checkpoint_path}")
+                missing_checkpoints.append(
+                    checkpoint_path
+                )
                 continue
             model = build_model(cfg, num_classes).to(device)
             model.load_state_dict(torch.load(checkpoint_path, map_location=device, weights_only=False)["model"])
@@ -64,7 +69,7 @@ def evaluate_grid(
             link = AnalogFeatureLink(
                 average_power=float(cfg["channel"].get("average_power", 1.0)),
                 fill_mode=str(cfg["semcom_training"].get("fill_mode", "mask")),
-                normalization_scale=scale,
+                normalization_scales=normalization_scales,
             ).to(device)
             for channel in channels:
                 for snr in snrs:
@@ -99,6 +104,17 @@ def evaluate_grid(
                             f"[done] {scheme} slots={budget} {channel} {snr:g} dB mc={mc_seed}: "
                             f"F1={result['macro_f1']:.4f}, minR={result['min_recall']:.4f}"
                         )
+            if missing_checkpoints:
+                missing = "\n".join(
+                    str(path)
+                    for path in missing_checkpoints
+                )
+
+                raise FileNotFoundError(
+                    "Evaluation incomplete. "
+                    "Missing checkpoints:\n"
+                    + missing
+                )
     return summarize_results(result_root)
 
 
@@ -125,6 +141,7 @@ def summarize_results(result_root: Path) -> Path:
                 "runtime_ms_per_sample": payload["runtime_ms_per_sample"],
                 "top2_pair_contains_label": payload["top2_pair_contains_label"],
                 "source_file": str(path),
+                "tx_power_mean": payload["tx_power_mean"],
             }
         )
     output = result_root / "summary_raw.csv"
@@ -145,6 +162,8 @@ def summarize_results(result_root: Path) -> Path:
                 worst_confusion_mean=("worst_directed_confusion", "mean"),
                 task_efficiency_mean=("task_efficiency", "mean"),
                 runtime_ms_mean=("runtime_ms_per_sample", "mean"),
+                tx_power_mean=("tx_power_mean", "mean",),
+                tx_power_std=("tx_power_mean", "std",),
             )
         )
         grouped.to_csv(result_root / "summary_aggregated.csv", index=False)

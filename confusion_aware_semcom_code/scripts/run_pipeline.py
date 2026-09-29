@@ -18,6 +18,7 @@ from semcom.engine import (
     save_run_metadata,
     train_clean_classifier,
     train_semcom_scheme,
+    load_feature_scales,
 )
 from semcom.io import atomic_json_dump, read_json
 from semcom.seed import seed_everything
@@ -82,11 +83,23 @@ def main() -> None:
             model = build_model(cfg, num_classes).to(device)
             model.load_state_dict(torch.load(clean_best, map_location=device, weights_only=False)["model"])
             if args.force or not scale_path.exists():
-                scale = calibrate_feature_scale(model, loaders["train"], device, scale_path)
+
+                normalization_scales = (
+                    calibrate_feature_scale(
+                        model,
+                        loaders["train"],
+                        device,
+                        scale_path,
+                    )
+                )
+
             else:
-                scale = float(torch.load(scale_path, map_location="cpu", weights_only=False)["normalization_scale"])
+
+                normalization_scales = (
+                    load_feature_scales(scale_path)
+                )
             if args.force or not graph_path.exists():
-                build_confusion_graph(cfg, model, loaders["val"], num_classes, scale, graph_path)
+                build_confusion_graph(cfg, model, loaders["val"], num_classes, normalization_scales, graph_path)
             if args.force or not codebook_path.exists():
                 build_pairwise_codebook(model, loaders["val"], num_classes, codebook_path)
             mark_state(
